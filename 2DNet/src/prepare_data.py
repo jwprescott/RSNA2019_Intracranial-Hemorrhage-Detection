@@ -59,10 +59,10 @@ def normalize_minmax(img):
     return (img - mi) / (ma - mi)
 
 def prepare_image(img_path):
-    img_dicom = pydicom.read_file(img_path)
+    img_dicom = pydicom.dcmread(img_path)
     img_id = get_id(img_dicom)
     metadata = get_metadata_from_dicom(img_dicom)
-    img = window_image(img_dicom.pixel_array, **metadata)
+    img = window_image(img_dicom.pixel_array.astype(int), **metadata)
     img = normalize_minmax(img) * 255
     img = PIL.Image.fromarray(img.astype(np.int8), mode="L")
     return img_id, img
