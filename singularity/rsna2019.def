@@ -1,0 +1,66 @@
+Bootstrap: docker
+From: pytorch/pytorch:1.13.1-cuda11.6-cudnn8-devel
+
+%labels
+    Author RSNA2019 Hemorrhage Detection
+    Version 1.0
+    Description Intracranial Hemorrhage Detection from CT scans
+
+%post
+    # Update and install system dependencies
+    apt-get update && apt-get install -y --no-install-recommends \
+        libgl1-mesa-glx \
+        libglib2.0-0 \
+        libsm6 \
+        libxext6 \
+        libxrender-dev \
+        git \
+        wget \
+        curl \
+        unzip \
+        vim \
+        build-essential \
+        && rm -rf /var/lib/apt/lists/*
+
+    # Upgrade pip
+    pip install --no-cache-dir --upgrade pip
+
+    # Install Python dependencies
+    pip install --no-cache-dir \
+        pretrainedmodels>=0.7.4 \
+        efficientnet-pytorch>=0.7.1 \
+        pydicom>=2.3.0 \
+        albumentations>=1.3.0 \
+        opencv-contrib-python>=4.5.0 \
+        scikit-image>=0.19.0 \
+        scikit-learn>=1.0.0 \
+        pandas>=1.3.0 \
+        "numpy>=1.21.0,<2.0.0" \
+        Pillow>=9.0.0 \
+        tqdm>=4.64.0 \
+        joblib>=1.1.0 \
+        gdown>=4.6.0
+
+    # Clean up
+    apt-get clean
+    rm -rf /var/lib/apt/lists/*
+
+%environment
+    export PYTHONUNBUFFERED=1
+    export LC_ALL=C
+
+%runscript
+    exec python "$@"
+
+%help
+    RSNA 2019 Intracranial Hemorrhage Detection Container
+
+    Build:
+        singularity build rsna2019.sif rsna2019.def
+
+    Run inference:
+        singularity exec --nv rsna2019.sif python inference/run_inference.py \
+            --data_dir /path/to/data --output predictions.csv
+
+    Interactive shell:
+        singularity shell --nv rsna2019.sif

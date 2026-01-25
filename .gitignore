@@ -1,0 +1,29 @@
+# Large data files
+data/
+models/
+
+# Singularity container images
+*.sif
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+.pytest_cache/
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Outputs
+predictions/
+output/
+
+# Temporary files
+*.tmp
+*.log
