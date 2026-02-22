@@ -112,11 +112,24 @@ def load_2d_model(model_name: str, model_path: str, device: torch.device) -> nn.
         raise ValueError(f"Unknown model: {model_name}. Available: {list(model_classes.keys())}")
 
     model = model_classes[model_name]()
-    model = nn.DataParallel(model)
+    use_dp = device.type == 'cuda' and torch.cuda.device_count() > 1
+    if use_dp:
+        model = nn.DataParallel(model)
 
     if os.path.exists(model_path):
         state = torch.load(model_path, map_location=device)
-        model.load_state_dict(state['state_dict'])
+        state_dict = state['state_dict'] if isinstance(state, dict) and 'state_dict' in state else state
+        try:
+            model.load_state_dict(state_dict)
+        except RuntimeError:
+            # Handle common DP/non-DP key mismatch by stripping "module." prefix.
+            stripped_state_dict = {}
+            for k, v in state_dict.items():
+                if k.startswith('module.'):
+                    stripped_state_dict[k[len('module.'):]] = v
+                else:
+                    stripped_state_dict[k] = v
+            model.load_state_dict(stripped_state_dict, strict=False)
         logger.info(f"Loaded {model_name} from {model_path}")
     else:
         logger.warning(f"Model weights not found: {model_path}")
@@ -146,29 +159,30 @@ def extract_features_2d(
     with torch.no_grad():
         for filenames, inputs in tqdm(dataloader, desc=f"Extracting {model_name}"):
             inputs = inputs.to(device)
+            net = model.module if hasattr(model, 'module') else model
 
             # Get features based on model type
             if 'DenseNet121' in model_name:
-                feat = model.module.densenet121(inputs)
-                feat = model.module.relu(feat)
-                feat = model.module.avgpool(feat)
+                feat = net.densenet121(inputs)
+                feat = net.relu(feat)
+                feat = net.avgpool(feat)
                 feat = feat.view(feat.size(0), -1)
-                out = model.module.mlp(feat)
+                out = net.mlp(feat)
             elif 'DenseNet169' in model_name:
-                feat = model.module.densenet169(inputs)
-                feat = model.module.relu(feat)
-                feat = model.module.avgpool(feat)
+                feat = net.densenet169(inputs)
+                feat = net.relu(feat)
+                feat = net.avgpool(feat)
                 feat = feat.view(feat.size(0), -1)
-                out = model.module.mlp(feat)
+                out = net.mlp(feat)
             elif 'se_resnext' in model_name:
-                feat = model.module.model_ft.layer0(inputs)
-                feat = model.module.model_ft.layer1(feat)
-                feat = model.module.model_ft.layer2(feat)
-                feat = model.module.model_ft.layer3(feat)
-                feat = model.module.model_ft.layer4(feat)
-                feat = model.module.model_ft.avg_pool(feat)
+                feat = net.model_ft.layer0(inputs)
+                feat = net.model_ft.layer1(feat)
+                feat = net.model_ft.layer2(feat)
+                feat = net.model_ft.layer3(feat)
+                feat = net.model_ft.layer4(feat)
+                feat = net.model_ft.avg_pool(feat)
                 feat = feat.view(feat.size(0), -1)
-                out = model.module.model_ft.last_linear(feat)
+                out = net.model_ft.last_linear(feat)
             else:
                 # Generic forward pass
                 out = model(inputs)
@@ -188,6 +202,7 @@ def run_inference(
     model_dir: str,
     output_path: str,
     batch_size: int = 16,
+    num_workers: int = 0,
     models_to_use: Optional[List[str]] = None,
     device: Optional[torch.device] = None
 ):
@@ -199,6 +214,7 @@ def run_inference(
         model_dir: Directory containing pretrained model weights
         output_path: Path for output CSV file
         batch_size: Batch size for inference
+        num_workers: DataLoader worker processes
         models_to_use: List of model names to use (default: all available)
         device: PyTorch device (default: auto-detect)
     """
@@ -256,8 +272,8 @@ def run_inference(
                 dataset,
                 batch_size=batch_size,
                 shuffle=False,
-                num_workers=4,
-                pin_memory=True
+                num_workers=num_workers,
+                pin_memory=(device.type == 'cuda')
             )
             logger.info(f"Created dataloader for {img_size}x{img_size} images")
 
@@ -379,6 +395,12 @@ def main():
         help='Batch size for inference'
     )
     parser.add_argument(
+        '--num_workers',
+        type=int,
+        default=0,
+        help='DataLoader worker processes'
+    )
+    parser.add_argument(
         '--models',
         type=str,
         nargs='+',
@@ -417,6 +439,7 @@ def main():
         model_dir=args.model_dir,
         output_path=args.output,
         batch_size=args.batch_size,
+        num_workers=args.num_workers,
         models_to_use=args.models,
         device=device
     )
