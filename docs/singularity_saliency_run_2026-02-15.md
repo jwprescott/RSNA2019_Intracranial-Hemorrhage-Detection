@@ -1,5 +1,8 @@
 # Singularity GPU Saliency Test Run (2026-02-15)
 
+Reusable run instructions are documented in:
+- `docs/custom_dicom_prediction_guide.md`
+
 ## Summary
 - Goal: run RSNA ICH inference on custom head CT DICOM series using Singularity on a SLURM GPU node, with saliency-map 3-panel outputs.
 - Source DICOM root (read-only): `/mnt/vstor/SOM_RAD_JWP84/lab/rsna-intracranial-hemorrhage-detection/rsna-intracranial-hemorrhage-detection/stage_2_test`

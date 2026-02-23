@@ -8,6 +8,10 @@
 #   --2d        Download only 2D CNN models
 #   --sequence  Download only sequence model weights
 #   --csv       Download only CSV data files
+#
+# Note:
+#   Google Drive links may be unreliable. Prefer:
+#     bash scripts/download_models_from_release.sh --tag model-weights-v1
 
 set -e
 
