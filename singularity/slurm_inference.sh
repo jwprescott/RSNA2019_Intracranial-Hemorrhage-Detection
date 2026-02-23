@@ -32,6 +32,7 @@ SIF_IMAGE="${SIF_IMAGE:-${PROJECT_DIR}/singularity/rsna2019.sif}"
 
 # Model directory
 MODEL_DIR="${MODEL_DIR:-${PROJECT_DIR}/models}"
+CACHE_DIR="${CACHE_DIR:-${PROJECT_DIR}/.cache/model_backbones}"
 
 echo "============================================================"
 echo "RSNA 2019 Hemorrhage Detection - Inference Job"
@@ -45,6 +46,7 @@ echo "  Project dir: ${PROJECT_DIR}"
 echo "  Data dir: ${DATA_DIR}"
 echo "  Output file: ${OUTPUT_FILE}"
 echo "  Model dir: ${MODEL_DIR}"
+echo "  Cache dir: ${CACHE_DIR}"
 echo "  SIF image: ${SIF_IMAGE}"
 echo "============================================================"
 
@@ -61,6 +63,8 @@ if [ ! -d "${DATA_DIR}" ]; then
     exit 1
 fi
 
+mkdir -p "${CACHE_DIR}/torch" "${CACHE_DIR}/pretrainedmodels"
+
 # Load modules (adjust for your cluster)
 # module load singularity
 # module load cuda/11.6
@@ -72,7 +76,10 @@ singularity exec --nv \
     --bind "${PROJECT_DIR}:/workspace" \
     --bind "${DATA_DIR}:/data" \
     --bind "${MODEL_DIR}:/models" \
+    --bind "${CACHE_DIR}:/model_cache" \
     --pwd /workspace \
+    --env "TORCH_HOME=/model_cache/torch" \
+    --env "PRETRAINEDMODELS_HOME=/model_cache/pretrainedmodels" \
     "${SIF_IMAGE}" \
     python inference/run_inference.py \
         --data_dir /data \

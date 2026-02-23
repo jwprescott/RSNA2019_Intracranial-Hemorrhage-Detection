@@ -6,7 +6,7 @@ This script:
 1. Reads DICOM files from an input directory
 2. Extracts study/series metadata
 3. Converts DICOM to PNG with proper windowing
-4. Generates required CSV files for the pipeline
+4. Generates required CSV files for the pipeline (series-grouped by default)
 
 Usage:
     python scripts/prepare_custom_data.py --input_dir /path/to/dicoms --output_dir /path/to/output
@@ -16,8 +16,6 @@ import os
 import argparse
 import logging
 from pathlib import Path
-from glob import glob
-from collections import defaultdict
 
 import numpy as np
 import pandas as pd
@@ -134,7 +132,7 @@ def process_dicom(dcm_path, output_dir):
         return None
 
 
-def prepare_data(input_dir, output_dir, n_jobs=-1):
+def prepare_data(input_dir, output_dir, n_jobs=-1, group_by='series'):
     """
     Prepare custom DICOM data for inference.
 
@@ -142,18 +140,41 @@ def prepare_data(input_dir, output_dir, n_jobs=-1):
         input_dir: Directory containing DICOM files (can be nested)
         output_dir: Output directory for PNG files and CSV metadata
         n_jobs: Number of parallel jobs (-1 for all CPUs)
+        group_by: Primary grouping key for slice indexing ('series' or 'study')
     """
+    group_by = str(group_by).strip().lower()
+    if group_by not in {'series', 'study'}:
+        raise ValueError(f"Unsupported group_by={group_by!r}. Expected 'series' or 'study'.")
+
+    primary_key = 'SeriesInstance' if group_by == 'series' else 'StudyInstance'
+    primary_label = 'series' if group_by == 'series' else 'studies'
+
     input_dir = Path(input_dir)
     output_dir = Path(output_dir)
 
     # Create output directories
     png_dir = output_dir / 'png'
     csv_dir = output_dir / 'csv'
+    series_csv_dir = csv_dir / 'series_csv'
     study_csv_dir = csv_dir / 'study_csv'
 
     png_dir.mkdir(parents=True, exist_ok=True)
     csv_dir.mkdir(parents=True, exist_ok=True)
+    series_csv_dir.mkdir(parents=True, exist_ok=True)
     study_csv_dir.mkdir(parents=True, exist_ok=True)
+
+    stale_pngs = list(png_dir.glob('*.png'))
+    for stale_png in stale_pngs:
+        stale_png.unlink()
+    if stale_pngs:
+        logger.info(f"Removed {len(stale_pngs)} existing PNG files from {png_dir}")
+
+    for out_csv_dir in (series_csv_dir, study_csv_dir):
+        stale_csvs = list(out_csv_dir.glob('*.csv'))
+        for stale_csv in stale_csvs:
+            stale_csv.unlink()
+        if stale_csvs:
+            logger.info(f"Removed {len(stale_csvs)} existing CSV files from {out_csv_dir}")
 
     # Find all DICOM files (common extensions)
     dcm_files = []
@@ -197,37 +218,58 @@ def prepare_data(input_dir, output_dir, n_jobs=-1):
     # Create main metadata DataFrame
     df = pd.DataFrame(results)
 
-    # Sort by study and position
-    df = df.sort_values(['StudyInstance', 'Position2']).reset_index(drop=True)
+    # Sort by selected grouping key and position
+    df = df.sort_values([primary_key, 'Position2']).reset_index(drop=True)
 
-    # Add slice index within each study
-    df['slice_idx'] = df.groupby('StudyInstance').cumcount()
-    df['slice_id'] = df['StudyInstance'] + '_' + df['slice_idx'].astype(str)
+    # Add slice index within each selected group (series by default)
+    df['slice_idx'] = df.groupby(primary_key).cumcount()
+    df['slice_id'] = df[primary_key] + '_' + df['slice_idx'].astype(str)
 
     # Save main metadata CSV (compatible with train_meta_id_seriser.csv format)
     main_csv_path = csv_dir / 'test_meta_id_seriser.csv'
-    df[['filename', 'StudyInstance', 'Position2', 'slice_id']].to_csv(main_csv_path, index=False)
+    df[['filename', 'StudyInstance', 'SeriesInstance', 'Position2', 'slice_id']].to_csv(
+        main_csv_path,
+        index=False
+    )
     logger.info(f"Saved main metadata to {main_csv_path}")
 
-    # Create per-study CSV files
-    studies = df['StudyInstance'].unique()
-    logger.info(f"Creating CSV files for {len(studies)} studies...")
+    # Create per-series CSV files (primary for inference/saliency)
+    series_ids = df['SeriesInstance'].unique()
+    logger.info(f"Creating CSV files for {len(series_ids)} series...")
 
+    for series_id in tqdm(series_ids, desc="Creating series CSVs"):
+        series_df = df[df['SeriesInstance'] == series_id].copy()
+        series_df = series_df.sort_values('Position2').reset_index(drop=True)
+
+        # Add columns expected by the pipeline
+        series_df['index'] = range(len(series_df))
+
+        series_csv_path = series_csv_dir / f'{series_id}.csv'
+        series_df.to_csv(series_csv_path, index=False)
+
+    # Also create per-study CSVs for backward compatibility with older workflows.
+    studies = df['StudyInstance'].unique()
+    logger.info(f"Creating compatibility CSV files for {len(studies)} studies...")
     for study_id in tqdm(studies, desc="Creating study CSVs"):
         study_df = df[df['StudyInstance'] == study_id].copy()
         study_df = study_df.sort_values('Position2').reset_index(drop=True)
-
-        # Add columns expected by the pipeline
         study_df['index'] = range(len(study_df))
-
         study_csv_path = study_csv_dir / f'{study_id}.csv'
         study_df.to_csv(study_csv_path, index=False)
+
+    primary_group_ids = df[primary_key].unique()
 
     # Create a summary file
     summary = {
         'total_files': len(results),
+        'group_by': group_by,
+        'primary_group_key': primary_key,
+        'total_groups': len(primary_group_ids),
+        'groups': list(primary_group_ids),
+        'total_series': len(series_ids),
         'total_studies': len(studies),
         'studies': list(studies),
+        'series': list(series_ids),
         'output_dir': str(output_dir)
     }
 
@@ -250,14 +292,22 @@ def prepare_data(input_dir, output_dir, n_jobs=-1):
     logger.info(f"  PNG files: {png_dir}")
     logger.info(f"  CSV files: {csv_dir}")
     logger.info(f"  Total slices: {len(results)}")
+    logger.info(f"  Grouping mode: {group_by} ({primary_key})")
+    logger.info(f"  Total {primary_label}: {len(primary_group_ids)}")
+    logger.info(f"  Total series: {len(series_ids)}")
     logger.info(f"  Total studies: {len(studies)}")
 
     return {
         'png_dir': str(png_dir),
         'csv_dir': str(csv_dir),
+        'group_by': group_by,
+        'group_key': primary_key,
+        'num_groups': len(primary_group_ids),
         'num_slices': len(results),
+        'num_series': len(series_ids),
         'num_studies': len(studies),
-        'studies': list(studies)
+        'studies': list(studies),
+        'series': list(series_ids)
     }
 
 
@@ -284,10 +334,17 @@ def main():
         default=-1,
         help='Number of parallel jobs (-1 for all CPUs)'
     )
+    parser.add_argument(
+        '--group_by',
+        type=str,
+        choices=['series', 'study'],
+        default='series',
+        help='Primary grouping for slice indexing and metadata outputs'
+    )
 
     args = parser.parse_args()
 
-    result = prepare_data(args.input_dir, args.output_dir, args.n_jobs)
+    result = prepare_data(args.input_dir, args.output_dir, args.n_jobs, group_by=args.group_by)
 
     if result:
         print("\n" + "="*60)

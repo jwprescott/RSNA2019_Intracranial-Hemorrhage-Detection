@@ -111,7 +111,9 @@ def load_2d_model(model_name: str, model_path: str, device: torch.device) -> nn.
     if model_name not in model_classes:
         raise ValueError(f"Unknown model: {model_name}. Available: {list(model_classes.keys())}")
 
-    model = model_classes[model_name]()
+    # In inference we load full RSNA checkpoints right after construction, so
+    # ImageNet backbone download is unnecessary and can be skipped.
+    model = model_classes[model_name](use_imagenet_pretrained=False)
     use_dp = device.type == 'cuda' and torch.cuda.device_count() > 1
     if use_dp:
         model = nn.DataParallel(model)
@@ -428,7 +430,7 @@ def main():
 
         # Create temporary processed directory
         processed_dir = Path(args.dicom_dir).parent / 'processed_data'
-        prepare_data(args.dicom_dir, str(processed_dir))
+        prepare_data(args.dicom_dir, str(processed_dir), group_by='series')
         data_dir = str(processed_dir)
     else:
         data_dir = args.data_dir

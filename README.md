@@ -103,9 +103,28 @@ The final submissions are in the folder ../FinalSubmission/version2/submission_t
 
 # Running Inference on Custom CT Data
 
-This section describes how to run the pretrained models on your own DICOM CT images using Singularity containers (for HPC/SLURM clusters).
+This section describes how to run the pretrained models on your own DICOM CT images using Docker with NVIDIA GPUs or Singularity (for HPC/SLURM clusters).
 
-## Quick Start
+## Quick Start (Docker + GPU)
+
+```bash
+# 1. Build Docker image
+docker build -t rsna2019-ich:gpu -f docker/Dockerfile .
+
+# 2. Download pretrained models
+bash scripts/download_models_from_release.sh --tag model-weights-v1
+
+# 3. Run preprocessing + inference + saliency export
+bash docker/run_pipeline.sh \
+    --dicom_dir /path/to/dicoms \
+    --run_root "$PWD/tmp/docker_run_$(date +%Y%m%d_%H%M%S)"
+```
+
+The preprocessing step groups slices by `SeriesInstanceUID` by default (`--group_by series`).
+Inference now skips ImageNet backbone downloads and loads only your local RSNA checkpoints.
+Optional: set `--cache_dir /path/to/cache` to persist PyTorch/pretrainedmodels caches for other workflows.
+
+## Quick Start (Singularity)
 
 ```bash
 # 1. Build the Singularity container
@@ -120,7 +139,7 @@ singularity exec rsna2019.sif bash -c 'export PATH="$HOME/.local/bin:$PATH" && b
 
 # 4. Prepare your DICOM data
 singularity exec rsna2019.sif python scripts/prepare_custom_data.py \
-    --input_dir /path/to/dicoms --output_dir /path/to/processed
+    --input_dir /path/to/dicoms --output_dir /path/to/processed --group_by series
 
 # 5. Run inference
 singularity exec --nv rsna2019.sif python inference/run_inference.py \
@@ -221,6 +240,8 @@ Output files:
 | `singularity/setup_env.sh` | Python package installer |
 | `singularity/slurm_inference.sh` | SLURM GPU job script |
 | `singularity/slurm_prepare_data.sh` | SLURM CPU job script |
+| `docker/Dockerfile` | Docker GPU image definition |
+| `docker/run_pipeline.sh` | Docker end-to-end inference + saliency runner |
 | `scripts/download_models.sh` | Model download script |
 | `scripts/prepare_custom_data.py` | DICOM preprocessing |
 | `inference/run_inference.py` | Main inference pipeline |
@@ -308,4 +329,3 @@ If tunnels don't work, use SSH Remote extension:
    ```
 3. Connect via **Remote-SSH: Connect to Host...**
 4. Note: This connects to login node, not compute node
-

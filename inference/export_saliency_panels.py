@@ -185,13 +185,31 @@ def _overlay(brain_gray: np.ndarray, saliency: np.ndarray) -> np.ndarray:
     return np.clip(out, 0.0, 1.0)
 
 
-def _sorted_series_rows(data_dir: Path) -> List[Tuple[str, pd.DataFrame]]:
+def _resolve_series_csv_dir(data_dir: Path) -> Path:
+    series_csv_dir = data_dir / "csv" / "series_csv"
+    if series_csv_dir.exists():
+        logger.info("Using series metadata at %s", series_csv_dir)
+        return series_csv_dir
+
     study_csv_dir = data_dir / "csv" / "study_csv"
-    if not study_csv_dir.exists():
-        raise FileNotFoundError(f"Missing study CSV directory: {study_csv_dir}")
+    if study_csv_dir.exists():
+        logger.warning(
+            "Using legacy study_csv metadata at %s. "
+            "For SeriesInstanceUID grouping, regenerate data with scripts/prepare_custom_data.py.",
+            study_csv_dir,
+        )
+        return study_csv_dir
+
+    raise FileNotFoundError(
+        f"Missing metadata directory. Expected one of: {series_csv_dir}, {study_csv_dir}"
+    )
+
+
+def _sorted_series_rows(data_dir: Path) -> List[Tuple[str, pd.DataFrame]]:
+    series_csv_dir = _resolve_series_csv_dir(data_dir)
 
     rows: List[Tuple[str, pd.DataFrame]] = []
-    for csv_path in sorted(study_csv_dir.glob("*.csv")):
+    for csv_path in sorted(series_csv_dir.glob("*.csv")):
         series_id = csv_path.stem
         df = pd.read_csv(csv_path)
         if "Position2" in df.columns:

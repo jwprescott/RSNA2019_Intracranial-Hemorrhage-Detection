@@ -1,4 +1,4 @@
-# Custom CT DICOM Prediction Guide (SLURM + Singularity)
+# Custom CT DICOM Prediction Guide (Docker GPU + SLURM/Singularity)
 
 This guide documents the current inference workflow in this repository for running predictions on your own head CT DICOM files.
 
@@ -20,6 +20,8 @@ Important model behavior:
 
 ## Key Files
 
+- Docker image definition: `docker/Dockerfile`
+- Docker end-to-end runner: `docker/run_pipeline.sh`
 - Main SLURM workflow: `singularity/slurm_series3_saliency_test.sh`
 - DICOM preprocessing: `scripts/prepare_custom_data.py`
 - Ensemble inference: `inference/run_inference.py`
@@ -27,17 +29,16 @@ Important model behavior:
 
 ## Prerequisites
 
-From repo root (`/home/jwp84/lab/RSNA2019_Intracranial-Hemorrhage-Detection`):
+From repo root:
 
-1. Singularity image exists:
-- `singularity/rsna2019.sif`
-
-2. Pretrained model weights exist:
+1. Pretrained model weights exist:
 - `models/2DNet/DenseNet121_change_avg_512/model_epoch_best_*.pth`
 - `models/2DNet/DenseNet169_change_avg_256/model_epoch_best_*.pth`
 - `models/2DNet/se_resnext101_32x4d_256/model_epoch_best_*.pth`
 
-3. Python deps are available at:
+2. For Docker runs: Docker + NVIDIA Container Toolkit installed (`docker run --gpus all ...` works).
+
+3. For Singularity runs: Python deps are available at:
 - `.cache/singularity_pydeps`
 
 If `.cache/singularity_pydeps` is missing, create it once:
@@ -74,6 +75,34 @@ If release access is private, export either token variable first:
 - `GITHUB_TOKEN`
 - `GITHUB_TOKEN_RSNA_ICH_DETECTION_REPO`
 
+## Recommended: Run with Docker + GPU
+
+Build the image once:
+
+```bash
+cd /path/to/RSNA2019_Intracranial-Hemorrhage-Detection
+docker build -t rsna2019-ich:gpu -f docker/Dockerfile .
+```
+
+Run full pipeline (preprocess + inference + saliency):
+
+```bash
+cd /path/to/RSNA2019_Intracranial-Hemorrhage-Detection
+
+bash docker/run_pipeline.sh \
+  --dicom_dir /path/to/your/dicom/root \
+  --run_root "$PWD/tmp/docker_run_$(date +%Y%m%d_%H%M%S)"
+```
+
+The Docker runner performs:
+1. `scripts/prepare_custom_data.py` with `--group_by series`
+2. `inference/run_inference.py` (3-model ensemble)
+3. `inference/export_saliency_panels.py` (3-panel outputs using ensemble bars)
+
+Notes:
+- Inference loads local RSNA checkpoints directly and does not require ImageNet backbone downloads.
+- Docker runner supports `--cache_dir` to persist PyTorch/pretrainedmodels caches on the host.
+
 ## Recommended: Run Your Own DICOM Folder with SLURM
 
 Set your input and run locations:
@@ -100,7 +129,7 @@ sacct -j <JOB_ID> --format=JobID,State,ExitCode,Elapsed,NodeList -P
 ```
 
 The script runs:
-1. `scripts/prepare_custom_data.py` (DICOM -> PNG + study CSVs)
+1. `scripts/prepare_custom_data.py` (DICOM -> PNG + series CSVs)
 2. `inference/run_inference.py` (3-model ensemble predictions)
 3. `inference/export_saliency_panels.py` (3-panel saliency images, ensemble bar chart)
 
@@ -112,7 +141,7 @@ Under `${RUN_ROOT}/output`:
 - `predictions_per_slice.csv`
 - `saliency_panels/run_manifest.json`
 - `saliency_panels/all_slice_saliency_scores.csv`
-- `saliency_panels/<study_id>/*.png`
+- `saliency_panels/<series_id>/*.png`
 
 Notes:
 - Output is written under `${RUN_ROOT}` only.
@@ -145,6 +174,7 @@ singularity exec --nv \
   python scripts/prepare_custom_data.py \
   --input_dir "$DICOM_INPUT" \
   --output_dir "$PROCESSED_DIR" \
+  --group_by series \
   --n_jobs 8
 
 singularity exec --nv \
@@ -177,6 +207,7 @@ singularity exec --nv \
 
 ## Practical Caveats
 
-- `prepare_custom_data.py` groups slices by `StudyInstanceUID` (output folders are per study).
+- `prepare_custom_data.py` now groups slices by `SeriesInstanceUID` by default.
+- The script also writes compatibility files under `csv/study_csv/` for older workflows.
 - If DICOM metadata is malformed, you may see pydicom warnings; inference can still succeed.
 - If a slice is missing from `predictions_per_slice.csv`, saliency export falls back to single-model bars for that slice.

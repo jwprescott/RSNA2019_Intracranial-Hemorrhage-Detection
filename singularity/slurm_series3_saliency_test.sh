@@ -23,6 +23,7 @@ OUTPUT_DIR="${RUN_ROOT}/output"
 
 # Isolated dependency path for container python.
 PYDEPS="${PROJECT_DIR}/.cache/singularity_pydeps"
+CACHE_DIR="${CACHE_DIR:-${PROJECT_DIR}/.cache/model_backbones}"
 
 echo "============================================================"
 echo "RSNA series3 saliency test"
@@ -34,6 +35,7 @@ echo "Input DICOM dir: ${DICOM_INPUT}"
 echo "Run root: ${RUN_ROOT}"
 echo "SIF: ${SIF_IMAGE}"
 echo "PYDEPS: ${PYDEPS}"
+echo "Cache dir: ${CACHE_DIR}"
 echo "============================================================"
 
 if [ ! -f "${SIF_IMAGE}" ]; then
@@ -52,13 +54,17 @@ if [ ! -d "${PYDEPS}" ]; then
 fi
 
 mkdir -p "${PROCESSED_DIR}" "${OUTPUT_DIR}"
+mkdir -p "${CACHE_DIR}/torch" "${CACHE_DIR}/pretrainedmodels"
 
 SING_COMMON=(
     singularity exec --nv
     --bind "${PROJECT_DIR}:/workspace"
+    --bind "${CACHE_DIR}:/model_cache"
     --pwd /workspace
     --env PYTHONNOUSERSITE=1
     --env "PYTHONPATH=/workspace/.cache/singularity_pydeps"
+    --env "TORCH_HOME=/model_cache/torch"
+    --env "PRETRAINEDMODELS_HOME=/model_cache/pretrainedmodels"
     "${SIF_IMAGE}"
 )
 
@@ -66,6 +72,7 @@ echo "[1/3] Preparing DICOM subset -> processed PNG/CSV"
 "${SING_COMMON[@]}" python scripts/prepare_custom_data.py \
     --input_dir "${DICOM_INPUT}" \
     --output_dir "${PROCESSED_DIR}" \
+    --group_by series \
     --n_jobs "${SLURM_CPUS_PER_TASK:-8}"
 
 echo "[2/3] Running RSNA inference"

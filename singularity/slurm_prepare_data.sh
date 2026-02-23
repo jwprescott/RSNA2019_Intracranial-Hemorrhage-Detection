@@ -23,6 +23,7 @@ OUTPUT_DIR="${2:-${OUTPUT_DIR:-/path/to/processed}}"
 # Project directory
 PROJECT_DIR="${PROJECT_DIR:-$(dirname $(dirname $(realpath $0)))}"
 SIF_IMAGE="${SIF_IMAGE:-${PROJECT_DIR}/singularity/rsna2019.sif}"
+CACHE_DIR="${CACHE_DIR:-${PROJECT_DIR}/.cache/model_backbones}"
 
 echo "============================================================"
 echo "RSNA 2019 - DICOM Data Preparation"
@@ -34,6 +35,7 @@ echo ""
 echo "Configuration:"
 echo "  DICOM dir: ${DICOM_DIR}"
 echo "  Output dir: ${OUTPUT_DIR}"
+echo "  Cache dir: ${CACHE_DIR}"
 echo "============================================================"
 
 # Check inputs
@@ -49,17 +51,22 @@ fi
 
 # Create output directory
 mkdir -p "${OUTPUT_DIR}"
+mkdir -p "${CACHE_DIR}/torch" "${CACHE_DIR}/pretrainedmodels"
 
 # Run data preparation
 singularity exec \
     --bind "${PROJECT_DIR}:/workspace" \
     --bind "${DICOM_DIR}:/input" \
     --bind "${OUTPUT_DIR}:/output" \
+    --bind "${CACHE_DIR}:/model_cache" \
     --pwd /workspace \
+    --env "TORCH_HOME=/model_cache/torch" \
+    --env "PRETRAINEDMODELS_HOME=/model_cache/pretrainedmodels" \
     "${SIF_IMAGE}" \
     python scripts/prepare_custom_data.py \
         --input_dir /input \
         --output_dir /output \
+        --group_by series \
         --n_jobs ${SLURM_CPUS_PER_TASK:-8}
 
 if [ $? -eq 0 ]; then

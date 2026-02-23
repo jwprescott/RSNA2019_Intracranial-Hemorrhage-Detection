@@ -22,9 +22,13 @@ def l2_norm(input, axis=1):
     return output
 
 class se_resnext50_32x4d(nn.Module):
-    def __init__(self):
+    def __init__(self, use_imagenet_pretrained=True):
         super(se_resnext50_32x4d, self).__init__()
-        self.model_ft = pretrainedmodels.__dict__['se_resnext50_32x4d'](num_classes=1000, pretrained='imagenet')
+        pretrained_tag = 'imagenet' if use_imagenet_pretrained else None
+        self.model_ft = pretrainedmodels.__dict__['se_resnext50_32x4d'](
+            num_classes=1000,
+            pretrained=pretrained_tag
+        )
         num_ftrs = self.model_ft.last_linear.in_features
         self.model_ft.avg_pool = nn.AdaptiveAvgPool2d((1,1))
         self.model_ft.last_linear = nn.Sequential(nn.Linear(num_ftrs, 6, bias=True))
@@ -34,9 +38,13 @@ class se_resnext50_32x4d(nn.Module):
         return x
 
 class se_resnext101_32x4d(nn.Module):
-    def __init__(self):
+    def __init__(self, use_imagenet_pretrained=True):
         super(se_resnext101_32x4d, self).__init__()
-        self.model_ft = pretrainedmodels.__dict__['se_resnext101_32x4d'](num_classes=1000, pretrained='imagenet')
+        pretrained_tag = 'imagenet' if use_imagenet_pretrained else None
+        self.model_ft = pretrainedmodels.__dict__['se_resnext101_32x4d'](
+            num_classes=1000,
+            pretrained=pretrained_tag
+        )
         num_ftrs = self.model_ft.last_linear.in_features
         self.model_ft.avg_pool = nn.AdaptiveAvgPool2d((1,1))
         self.model_ft.last_linear = nn.Sequential(nn.Linear(num_ftrs, 6, bias=True))
@@ -46,9 +54,11 @@ class se_resnext101_32x4d(nn.Module):
         return x
 
 class DenseNet169_change_avg(nn.Module):
-    def __init__(self):
+    def __init__(self, use_imagenet_pretrained=True):
         super(DenseNet169_change_avg, self).__init__()
-        self.densenet169 = torchvision.models.densenet169(pretrained=True).features
+        self.densenet169 = torchvision.models.densenet169(
+            pretrained=use_imagenet_pretrained
+        ).features
         self.avgpool = nn.AdaptiveAvgPool2d(1)  
         self.relu = nn.ReLU()
         self.mlp = nn.Linear(1664, 6)
@@ -64,9 +74,11 @@ class DenseNet169_change_avg(nn.Module):
         return x
 
 class DenseNet121_change_avg(nn.Module):
-    def __init__(self):
+    def __init__(self, use_imagenet_pretrained=True):
         super(DenseNet121_change_avg, self).__init__()
-        self.densenet121 = torchvision.models.densenet121(pretrained=True).features
+        self.densenet121 = torchvision.models.densenet121(
+            pretrained=use_imagenet_pretrained
+        ).features
         self.avgpool = nn.AdaptiveAvgPool2d(1)  
         self.relu = nn.ReLU()
         self.mlp = nn.Linear(1024, 6)
@@ -80,4 +92,3 @@ class DenseNet121_change_avg(nn.Module):
         x = self.mlp(x)
         
         return x
-
