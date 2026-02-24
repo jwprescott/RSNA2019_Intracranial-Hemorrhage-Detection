@@ -107,6 +107,8 @@ Notes:
 - Inference loads local RSNA checkpoints directly and does not require ImageNet backbone downloads.
 - Docker runner supports `--cache_dir` to persist PyTorch/pretrainedmodels caches on the host.
 - For non-SLURM workstations, `--auto_batch_size` can maximize throughput automatically; tune with `--auto_batch_size_max`.
+- Auto batch size is cached and reused by default; override via `--auto_batch_size_cache_path` or disable via `--disable_auto_batch_size_cache`.
+- If runtime CUDA OOM occurs, inference automatically retries with smaller batch sizes.
 
 ## Recommended: Run Your Own DICOM Folder with SLURM
 

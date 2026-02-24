@@ -20,6 +20,9 @@ import os
 import sys
 import argparse
 import logging
+import json
+import hashlib
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
@@ -148,7 +151,15 @@ def load_2d_model(model_name: str, model_path: str, device: torch.device) -> nn.
 
 
 def _is_oom_error(exc: RuntimeError) -> bool:
-    return 'out of memory' in str(exc).lower()
+    msg = str(exc).lower()
+    oom_markers = (
+        'out of memory',
+        'cuda error: out of memory',
+        'cudnn_status_alloc_failed',
+        'cudnn_status_not_supported',
+        'cudnn_status_internal_error',
+    )
+    return any(marker in msg for marker in oom_markers)
 
 
 def _forward_features_and_logits(
@@ -288,6 +299,109 @@ def _auto_select_batch_size(
     return final_bs
 
 
+def _now_iso_utc() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _auto_batch_cache_key(
+    models_to_use: List[str],
+    model_configs: Dict[str, Dict[str, object]],
+    model_weight_files: Dict[str, List[Path]],
+    max_folds_per_model: Optional[int],
+    auto_batch_size_max: int,
+    device: torch.device
+) -> str:
+    gpu_signature = []
+    if device.type == 'cuda':
+        for i in range(torch.cuda.device_count()):
+            props = torch.cuda.get_device_properties(i)
+            gpu_signature.append({
+                'index': i,
+                'name': props.name,
+                'total_memory': int(props.total_memory),
+            })
+
+    payload = {
+        'version': 1,
+        'gpus': gpu_signature,
+        'models': sorted(models_to_use),
+        'image_sizes': {m: int(model_configs[m]['image_size']) for m in sorted(models_to_use)},
+        'fold_counts': {
+            m: len(model_weight_files.get(m, []))
+            for m in sorted(models_to_use)
+        },
+        'max_folds_per_model': max_folds_per_model,
+        'auto_batch_size_max': int(auto_batch_size_max),
+    }
+    raw = json.dumps(payload, sort_keys=True).encode('utf-8')
+    return hashlib.sha256(raw).hexdigest()
+
+
+def _load_auto_batch_cache(cache_path: Path) -> Dict[str, dict]:
+    if not cache_path.exists():
+        return {}
+    try:
+        data = json.loads(cache_path.read_text())
+        if isinstance(data, dict):
+            return data
+    except Exception as exc:
+        logger.warning("Could not parse auto-batch cache at %s: %s", cache_path, exc)
+    return {}
+
+
+def _write_auto_batch_cache(cache_path: Path, cache_data: Dict[str, dict]) -> None:
+    try:
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+        tmp_path = cache_path.with_suffix(cache_path.suffix + '.tmp')
+        tmp_path.write_text(json.dumps(cache_data, indent=2, sort_keys=True))
+        tmp_path.replace(cache_path)
+    except Exception as exc:
+        logger.warning("Failed to write auto-batch cache at %s: %s", cache_path, exc)
+
+
+def _get_cached_auto_batch_size(cache_path: Path, cache_key: str) -> Optional[int]:
+    cache = _load_auto_batch_cache(cache_path)
+    entry = cache.get(cache_key)
+    if not isinstance(entry, dict):
+        return None
+    value = entry.get('batch_size')
+    if isinstance(value, int) and value > 0:
+        return value
+    return None
+
+
+def _set_cached_auto_batch_size(
+    cache_path: Path,
+    cache_key: str,
+    batch_size: int,
+    note: str
+) -> None:
+    cache = _load_auto_batch_cache(cache_path)
+    cache[cache_key] = {
+        'batch_size': int(batch_size),
+        'updated_at': _now_iso_utc(),
+        'note': note,
+    }
+    _write_auto_batch_cache(cache_path, cache)
+
+
+def _create_inference_dataloader(
+    image_paths: List[str],
+    image_size: int,
+    batch_size: int,
+    num_workers: int,
+    device: torch.device
+) -> DataLoader:
+    dataset = InferenceDataset(image_paths, image_size=image_size)
+    return DataLoader(
+        dataset,
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=num_workers,
+        pin_memory=(device.type == 'cuda')
+    )
+
+
 def extract_features_2d(
     model: nn.Module,
     model_name: str,
@@ -329,6 +443,8 @@ def run_inference(
     max_folds_per_model: Optional[int] = None,
     auto_batch_size: bool = False,
     auto_batch_size_max: int = 128,
+    auto_batch_size_cache_path: Optional[str] = None,
+    disable_auto_batch_size_cache: bool = False,
     device: Optional[torch.device] = None
 ):
     """
@@ -344,6 +460,8 @@ def run_inference(
         max_folds_per_model: Max fold checkpoints to use per backbone (default: all available)
         auto_batch_size: Auto-tune batch size for GPU inference
         auto_batch_size_max: Upper bound used for auto batch size search
+        auto_batch_size_cache_path: Optional JSON cache path for auto batch size reuse
+        disable_auto_batch_size_cache: Disable reading/writing auto batch cache
         device: PyTorch device (default: auto-detect)
     """
     if device is None:
@@ -423,42 +541,66 @@ def run_inference(
 
         model_weight_files[model_name] = weight_files
 
+    auto_batch_cache_path: Optional[Path] = None
+    auto_batch_cache_key: Optional[str] = None
+
     if auto_batch_size:
         if device.type != 'cuda':
             logger.warning("Ignoring --auto_batch_size on non-CUDA device; using provided batch_size=%d", batch_size)
         else:
-            batch_size = _auto_select_batch_size(
+            auto_batch_cache_path = Path(
+                auto_batch_size_cache_path
+                if auto_batch_size_cache_path is not None
+                else (PROJECT_ROOT / '.cache' / 'auto_batch_size_cache.json')
+            )
+            auto_batch_cache_key = _auto_batch_cache_key(
+                models_to_use=models_to_use,
                 model_configs=model_configs,
                 model_weight_files=model_weight_files,
-                models_to_use=models_to_use,
+                max_folds_per_model=max_folds_per_model,
+                auto_batch_size_max=auto_batch_size_max,
                 device=device,
-                max_batch_size=auto_batch_size_max
             )
+
+            cached_batch_size = None
+            if not disable_auto_batch_size_cache:
+                cached_batch_size = _get_cached_auto_batch_size(
+                    auto_batch_cache_path, auto_batch_cache_key
+                )
+
+            if cached_batch_size is not None:
+                batch_size = min(cached_batch_size, auto_batch_size_max)
+                logger.info(
+                    "Using cached auto batch size: %d (cache=%s)",
+                    batch_size,
+                    auto_batch_cache_path,
+                )
+            else:
+                batch_size = _auto_select_batch_size(
+                    model_configs=model_configs,
+                    model_weight_files=model_weight_files,
+                    models_to_use=models_to_use,
+                    device=device,
+                    max_batch_size=auto_batch_size_max
+                )
+                if not disable_auto_batch_size_cache:
+                    _set_cached_auto_batch_size(
+                        auto_batch_cache_path,
+                        auto_batch_cache_key,
+                        batch_size,
+                        note='auto_tuned'
+                    )
     logger.info("Using inference batch size: %d", batch_size)
 
     # Collect predictions from all models
     all_predictions = {}
-
-    # Create dataloaders for each image size (to avoid recreating for each model)
-    dataloaders = {}
-    for model_name in models_to_use:
-        img_size = model_configs[model_name]['image_size']
-        if img_size not in dataloaders:
-            dataset = InferenceDataset([str(p) for p in image_paths], image_size=img_size)
-            dataloaders[img_size] = DataLoader(
-                dataset,
-                batch_size=batch_size,
-                shuffle=False,
-                num_workers=num_workers,
-                pin_memory=(device.type == 'cuda')
-            )
-            logger.info(f"Created dataloader for {img_size}x{img_size} images")
+    image_path_strs = [str(p) for p in image_paths]
+    current_batch_size = batch_size
 
     for model_name in models_to_use:
         config = model_configs[model_name]
         model_subdir = config['subdir']
         img_size = config['image_size']
-        dataloader = dataloaders[img_size]
         model_weights_dir = model_dir / '2DNet' / model_subdir
         weight_files = model_weight_files.get(model_name, [])
         if not weight_files:
@@ -480,20 +622,78 @@ def run_inference(
                 len(weight_files),
                 weight_path.name
             )
-            try:
-                model = load_2d_model(model_name, str(weight_path), device)
-                _, predictions = extract_features_2d(model, model_name, dataloader, device)
-                fold_predictions.append(predictions)
-            except Exception as e:
-                logger.error(f"Error loading {model_name} fold from {weight_path}: {e}")
-            finally:
-                # Free GPU memory
+            fold_batch_size = current_batch_size
+            fold_succeeded = False
+
+            while not fold_succeeded:
+                model = None
+                dataloader = None
                 try:
-                    del model
-                except UnboundLocalError:
-                    pass
-                if device.type == 'cuda':
-                    torch.cuda.empty_cache()
+                    dataloader = _create_inference_dataloader(
+                        image_paths=image_path_strs,
+                        image_size=img_size,
+                        batch_size=fold_batch_size,
+                        num_workers=num_workers,
+                        device=device,
+                    )
+                    model = load_2d_model(model_name, str(weight_path), device)
+                    _, predictions = extract_features_2d(model, model_name, dataloader, device)
+                    fold_predictions.append(predictions)
+                    fold_succeeded = True
+
+                    if fold_batch_size < current_batch_size:
+                        logger.warning(
+                            "Reducing global inference batch size from %d to %d after OOM retry",
+                            current_batch_size,
+                            fold_batch_size
+                        )
+                        current_batch_size = fold_batch_size
+                        if auto_batch_size and device.type == 'cuda' and not disable_auto_batch_size_cache \
+                                and auto_batch_cache_path is not None and auto_batch_cache_key is not None:
+                            _set_cached_auto_batch_size(
+                                auto_batch_cache_path,
+                                auto_batch_cache_key,
+                                current_batch_size,
+                                note='reduced_after_runtime_oom'
+                            )
+                except RuntimeError as exc:
+                    if device.type == 'cuda' and _is_oom_error(exc):
+                        if fold_batch_size <= 1:
+                            raise RuntimeError(
+                                f"OOM for {model_name} ({weight_path.name}) even at batch_size=1"
+                            ) from exc
+                        next_batch_size = max(1, fold_batch_size // 2)
+                        logger.warning(
+                            "CUDA OOM for %s (%s) at batch size %d. Retrying with batch size %d.",
+                            model_name,
+                            weight_path.name,
+                            fold_batch_size,
+                            next_batch_size
+                        )
+                        fold_batch_size = next_batch_size
+                    else:
+                        logger.error(
+                            "Error loading %s fold from %s: %s",
+                            model_name,
+                            weight_path,
+                            exc
+                        )
+                        break
+                except Exception as exc:
+                    logger.error(
+                        "Error loading %s fold from %s: %s",
+                        model_name,
+                        weight_path,
+                        exc
+                    )
+                    break
+                finally:
+                    if dataloader is not None:
+                        del dataloader
+                    if model is not None:
+                        del model
+                    if device.type == 'cuda':
+                        torch.cuda.empty_cache()
 
         if not fold_predictions:
             logger.warning("No valid fold checkpoints were loaded for %s", model_name)
@@ -629,6 +829,17 @@ def main():
         help='Upper bound for auto batch size search'
     )
     parser.add_argument(
+        '--auto_batch_size_cache_path',
+        type=str,
+        default=None,
+        help='Optional JSON cache path for auto batch size reuse'
+    )
+    parser.add_argument(
+        '--disable_auto_batch_size_cache',
+        action='store_true',
+        help='Disable reading/writing auto batch size cache'
+    )
+    parser.add_argument(
         '--cpu',
         action='store_true',
         help='Force CPU inference'
@@ -665,6 +876,8 @@ def main():
         max_folds_per_model=args.max_folds_per_model,
         auto_batch_size=args.auto_batch_size,
         auto_batch_size_max=args.auto_batch_size_max,
+        auto_batch_size_cache_path=args.auto_batch_size_cache_path,
+        disable_auto_batch_size_cache=args.disable_auto_batch_size_cache,
         device=device
     )
 

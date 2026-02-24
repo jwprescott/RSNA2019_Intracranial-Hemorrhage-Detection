@@ -124,6 +124,8 @@ The preprocessing step groups slices by `SeriesInstanceUID` by default (`--group
 Inference now skips ImageNet backbone downloads and loads only your local RSNA checkpoints.
 Inference averages all available fold checkpoints per backbone (`model_epoch_best_0..4.pth`) and then ensembles across backbones.
 Optional for workstation GPU tuning: add `--auto_batch_size` (and optionally `--auto_batch_size_max 256`) to auto-select the largest safe inference batch size.
+Auto batch size is cached by default in `.cache/auto_batch_size_cache.json` and reused on matching GPU/model configs.
+If a runtime CUDA OOM still occurs, inference automatically retries with smaller batch sizes until it succeeds.
 Optional: set `--cache_dir /path/to/cache` to persist PyTorch/pretrainedmodels caches for other workflows.
 
 ## Quick Start (Singularity)
