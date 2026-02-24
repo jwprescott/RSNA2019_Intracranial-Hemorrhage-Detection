@@ -13,10 +13,13 @@ This guide documents the current inference workflow in this repository for runni
   3. class-probability bar chart
 
 Important model behavior:
-- Final prediction CSVs are from a 3-model ensemble (`DenseNet121_change_avg`, `DenseNet169_change_avg`, `se_resnext101_32x4d`).
-- Saliency overlays are from a single model (`DenseNet169_change_avg`).
+- Final prediction CSVs use two-stage ensembling:
+  1. average across all available fold checkpoints (`model_epoch_best_0..4.pth`) within each backbone
+  2. average across the 3 backbones (`DenseNet121_change_avg`, `DenseNet169_change_avg`, `se_resnext101_32x4d`)
+- Saliency overlays are from an equal-weight ensemble of all three backbones, using
+  normalized per-model class outputs and normalized per-model saliency maps.
 - The bar chart in saliency panels uses ensemble probabilities (from `predictions_per_slice.csv`).
-- Each panel includes text noting: single-model saliency + ensemble bar source.
+- Each panel includes text noting: ensemble saliency source + bar source.
 
 ## Key Files
 
@@ -91,17 +94,19 @@ cd /path/to/RSNA2019_Intracranial-Hemorrhage-Detection
 
 bash docker/run_pipeline.sh \
   --dicom_dir /path/to/your/dicom/root \
-  --run_root "$PWD/tmp/docker_run_$(date +%Y%m%d_%H%M%S)"
+  --run_root "$PWD/tmp/docker_run_$(date +%Y%m%d_%H%M%S)" \
+  --auto_batch_size
 ```
 
 The Docker runner performs:
 1. `scripts/prepare_custom_data.py` with `--group_by series`
-2. `inference/run_inference.py` (3-model ensemble)
+2. `inference/run_inference.py` (fold-averaged per backbone + cross-backbone ensemble)
 3. `inference/export_saliency_panels.py` (3-panel outputs using ensemble bars)
 
 Notes:
 - Inference loads local RSNA checkpoints directly and does not require ImageNet backbone downloads.
 - Docker runner supports `--cache_dir` to persist PyTorch/pretrainedmodels caches on the host.
+- For non-SLURM workstations, `--auto_batch_size` can maximize throughput automatically; tune with `--auto_batch_size_max`.
 
 ## Recommended: Run Your Own DICOM Folder with SLURM
 
@@ -130,7 +135,7 @@ sacct -j <JOB_ID> --format=JobID,State,ExitCode,Elapsed,NodeList -P
 
 The script runs:
 1. `scripts/prepare_custom_data.py` (DICOM -> PNG + series CSVs)
-2. `inference/run_inference.py` (3-model ensemble predictions)
+2. `inference/run_inference.py` (fold-averaged per backbone + cross-backbone ensemble predictions)
 3. `inference/export_saliency_panels.py` (3-panel saliency images, ensemble bar chart)
 
 ## Output Layout
@@ -200,7 +205,7 @@ singularity exec --nv \
   --data_dir "$PROCESSED_DIR" \
   --output_dir "$OUTPUT_DIR/saliency_panels" \
   --model_dir /workspace/models \
-  --model DenseNet169_change_avg \
+  --saliency_mode ensemble \
   --ensemble_slice_csv "$OUTPUT_DIR/predictions_per_slice.csv" \
   --image_size_override 224
 ```

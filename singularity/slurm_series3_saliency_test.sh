@@ -88,7 +88,7 @@ echo "[3/3] Exporting 3-panel saliency images"
     --data_dir "${PROCESSED_DIR}" \
     --output_dir "${OUTPUT_DIR}/saliency_panels" \
     --model_dir /workspace/models \
-    --model DenseNet169_change_avg \
+    --saliency_mode ensemble \
     --ensemble_slice_csv "${OUTPUT_DIR}/predictions_per_slice.csv" \
     --image_size_override 224
 

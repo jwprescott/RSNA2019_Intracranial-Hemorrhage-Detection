@@ -19,8 +19,9 @@ CACHE_DIR="${CACHE_DIR:-${PROJECT_DIR}/.cache/model_backbones}"
 N_JOBS="${N_JOBS:-8}"
 BATCH_SIZE="${BATCH_SIZE:-16}"
 NUM_WORKERS="${NUM_WORKERS:-0}"
-SALIENCY_MODEL="${SALIENCY_MODEL:-DenseNet169_change_avg}"
 IMAGE_SIZE_OVERRIDE="${IMAGE_SIZE_OVERRIDE:-224}"
+AUTO_BATCH_SIZE="${AUTO_BATCH_SIZE:-0}"
+AUTO_BATCH_SIZE_MAX="${AUTO_BATCH_SIZE_MAX:-128}"
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -56,8 +57,12 @@ while [[ $# -gt 0 ]]; do
             NUM_WORKERS="$2"
             shift 2
             ;;
-        --saliency_model)
-            SALIENCY_MODEL="$2"
+        --auto_batch_size)
+            AUTO_BATCH_SIZE=1
+            shift
+            ;;
+        --auto_batch_size_max)
+            AUTO_BATCH_SIZE_MAX="$2"
             shift 2
             ;;
         --image_size_override)
@@ -77,7 +82,8 @@ Options:
   --n_jobs N                DICOM preprocessing workers (default: ${N_JOBS})
   --batch_size N            Inference batch size (default: ${BATCH_SIZE})
   --num_workers N           DataLoader workers (default: ${NUM_WORKERS})
-  --saliency_model NAME     Saliency model name (default: ${SALIENCY_MODEL})
+  --auto_batch_size         Auto-select batch size on available GPUs
+  --auto_batch_size_max N   Upper bound for auto batch size search (default: ${AUTO_BATCH_SIZE_MAX})
   --image_size_override N   Saliency input size (default: ${IMAGE_SIZE_OVERRIDE})
 EOF
             exit 0
@@ -134,7 +140,8 @@ docker run --rm --gpus all --ipc=host \
     -e N_JOBS="${N_JOBS}" \
     -e BATCH_SIZE="${BATCH_SIZE}" \
     -e NUM_WORKERS="${NUM_WORKERS}" \
-    -e SALIENCY_MODEL="${SALIENCY_MODEL}" \
+    -e AUTO_BATCH_SIZE="${AUTO_BATCH_SIZE}" \
+    -e AUTO_BATCH_SIZE_MAX="${AUTO_BATCH_SIZE_MAX}" \
     -e IMAGE_SIZE_OVERRIDE="${IMAGE_SIZE_OVERRIDE}" \
     "${IMAGE}" \
     bash -lc '
@@ -156,19 +163,24 @@ python scripts/prepare_custom_data.py \
     --n_jobs "${N_JOBS}"
 
 echo "[2/3] Running ensemble inference"
-python inference/run_inference.py \
-    --data_dir /run/processed \
-    --model_dir /models \
-    --output /run/output/predictions.csv \
-    --batch_size "${BATCH_SIZE}" \
+INFER_ARGS=(
+    --data_dir /run/processed
+    --model_dir /models
+    --output /run/output/predictions.csv
+    --batch_size "${BATCH_SIZE}"
     --num_workers "${NUM_WORKERS}"
+)
+if [[ "${AUTO_BATCH_SIZE}" == "1" ]]; then
+    INFER_ARGS+=(--auto_batch_size --auto_batch_size_max "${AUTO_BATCH_SIZE_MAX}")
+fi
+python inference/run_inference.py "${INFER_ARGS[@]}"
 
 echo "[3/3] Exporting saliency panels"
 SALIENCY_ARGS=(
     --data_dir /run/processed
     --output_dir /run/output/saliency_panels
     --model_dir /models
-    --model "${SALIENCY_MODEL}"
+    --saliency_mode ensemble
     --ensemble_slice_csv /run/output/predictions_per_slice.csv
 )
 if [[ -n "${IMAGE_SIZE_OVERRIDE}" ]]; then

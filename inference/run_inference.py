@@ -44,6 +44,7 @@ logging.basicConfig(
     format='%(asctime)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
+torch.backends.cudnn.benchmark = True
 
 # Hemorrhage types
 HEMORRHAGE_TYPES = ['any', 'epidural', 'intraparenchymal', 'intraventricular', 'subarachnoid', 'subdural']
@@ -117,6 +118,11 @@ def load_2d_model(model_name: str, model_path: str, device: torch.device) -> nn.
     use_dp = device.type == 'cuda' and torch.cuda.device_count() > 1
     if use_dp:
         model = nn.DataParallel(model)
+        logger.info(
+            "Enabled DataParallel for %s across %d visible GPUs",
+            model_name,
+            torch.cuda.device_count()
+        )
 
     if os.path.exists(model_path):
         state = torch.load(model_path, map_location=device)
@@ -141,6 +147,147 @@ def load_2d_model(model_name: str, model_path: str, device: torch.device) -> nn.
     return model
 
 
+def _is_oom_error(exc: RuntimeError) -> bool:
+    return 'out of memory' in str(exc).lower()
+
+
+def _forward_features_and_logits(
+    model: nn.Module,
+    model_name: str,
+    inputs: torch.Tensor
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    net = model.module if hasattr(model, 'module') else model
+
+    if 'DenseNet121' in model_name:
+        feat = net.densenet121(inputs)
+        feat = net.relu(feat)
+        feat = net.avgpool(feat)
+        feat = feat.view(feat.size(0), -1)
+        out = net.mlp(feat)
+    elif 'DenseNet169' in model_name:
+        feat = net.densenet169(inputs)
+        feat = net.relu(feat)
+        feat = net.avgpool(feat)
+        feat = feat.view(feat.size(0), -1)
+        out = net.mlp(feat)
+    elif 'se_resnext' in model_name:
+        feat = net.model_ft.layer0(inputs)
+        feat = net.model_ft.layer1(feat)
+        feat = net.model_ft.layer2(feat)
+        feat = net.model_ft.layer3(feat)
+        feat = net.model_ft.layer4(feat)
+        feat = net.model_ft.avg_pool(feat)
+        feat = feat.view(feat.size(0), -1)
+        out = net.model_ft.last_linear(feat)
+    else:
+        out = model(inputs)
+        feat = out
+    return feat, out
+
+
+def _can_run_batch_size(
+    model: nn.Module,
+    model_name: str,
+    device: torch.device,
+    image_size: int,
+    batch_size: int
+) -> bool:
+    try:
+        with torch.no_grad():
+            x = torch.zeros((batch_size, 3, image_size, image_size), device=device)
+            _, out = _forward_features_and_logits(model, model_name, x)
+            # Force evaluation so kernel launches are realized.
+            _ = out.mean().item()
+        del x
+        del out
+        if device.type == 'cuda':
+            torch.cuda.synchronize()
+        return True
+    except RuntimeError as exc:
+        if _is_oom_error(exc):
+            if device.type == 'cuda':
+                torch.cuda.empty_cache()
+            return False
+        raise
+
+
+def _auto_select_batch_size_for_model(
+    model_name: str,
+    weight_path: Path,
+    image_size: int,
+    device: torch.device,
+    max_batch_size: int
+) -> int:
+    model = load_2d_model(model_name, str(weight_path), device)
+    try:
+        if not _can_run_batch_size(model, model_name, device, image_size, 1):
+            raise RuntimeError(
+                f"GPU OOM for {model_name} even at batch_size=1 (image_size={image_size})."
+            )
+
+        if _can_run_batch_size(model, model_name, device, image_size, max_batch_size):
+            return max_batch_size
+
+        low = 1
+        high = max_batch_size
+        while low < high:
+            mid = (low + high + 1) // 2
+            if _can_run_batch_size(model, model_name, device, image_size, mid):
+                low = mid
+            else:
+                high = mid - 1
+        return low
+    finally:
+        del model
+        if device.type == 'cuda':
+            torch.cuda.empty_cache()
+
+
+def _auto_select_batch_size(
+    model_configs: Dict[str, Dict[str, object]],
+    model_weight_files: Dict[str, List[Path]],
+    models_to_use: List[str],
+    device: torch.device,
+    max_batch_size: int
+) -> int:
+    per_model_limits = []
+    for model_name in models_to_use:
+        if model_name not in model_weight_files or not model_weight_files[model_name]:
+            continue
+        image_size = int(model_configs[model_name]['image_size'])
+        first_weight = model_weight_files[model_name][0]
+        logger.info(
+            "Auto-tuning batch size for %s (%dx%d) using %s",
+            model_name,
+            image_size,
+            image_size,
+            first_weight.name
+        )
+        model_limit = _auto_select_batch_size_for_model(
+            model_name=model_name,
+            weight_path=first_weight,
+            image_size=image_size,
+            device=device,
+            max_batch_size=max_batch_size
+        )
+        logger.info("Auto-tuned max batch size for %s: %d", model_name, model_limit)
+        per_model_limits.append(model_limit)
+
+    if not per_model_limits:
+        raise ValueError("Auto batch size could not be determined: no valid model checkpoints found.")
+
+    final_bs = max(1, min(per_model_limits))
+    if device.type == 'cuda' and torch.cuda.device_count() > 1 and final_bs < torch.cuda.device_count():
+        logger.warning(
+            "Auto-selected batch size (%d) is smaller than visible GPU count (%d); "
+            "DataParallel may not fully saturate all GPUs.",
+            final_bs,
+            torch.cuda.device_count()
+        )
+    logger.info("Auto-selected global batch size (min across backbones): %d", final_bs)
+    return final_bs
+
+
 def extract_features_2d(
     model: nn.Module,
     model_name: str,
@@ -161,34 +308,7 @@ def extract_features_2d(
     with torch.no_grad():
         for filenames, inputs in tqdm(dataloader, desc=f"Extracting {model_name}"):
             inputs = inputs.to(device)
-            net = model.module if hasattr(model, 'module') else model
-
-            # Get features based on model type
-            if 'DenseNet121' in model_name:
-                feat = net.densenet121(inputs)
-                feat = net.relu(feat)
-                feat = net.avgpool(feat)
-                feat = feat.view(feat.size(0), -1)
-                out = net.mlp(feat)
-            elif 'DenseNet169' in model_name:
-                feat = net.densenet169(inputs)
-                feat = net.relu(feat)
-                feat = net.avgpool(feat)
-                feat = feat.view(feat.size(0), -1)
-                out = net.mlp(feat)
-            elif 'se_resnext' in model_name:
-                feat = net.model_ft.layer0(inputs)
-                feat = net.model_ft.layer1(feat)
-                feat = net.model_ft.layer2(feat)
-                feat = net.model_ft.layer3(feat)
-                feat = net.model_ft.layer4(feat)
-                feat = net.model_ft.avg_pool(feat)
-                feat = feat.view(feat.size(0), -1)
-                out = net.model_ft.last_linear(feat)
-            else:
-                # Generic forward pass
-                out = model(inputs)
-                feat = out
+            feat, out = _forward_features_and_logits(model, model_name, inputs)
 
             probs = torch.sigmoid(out)
 
@@ -206,6 +326,9 @@ def run_inference(
     batch_size: int = 16,
     num_workers: int = 0,
     models_to_use: Optional[List[str]] = None,
+    max_folds_per_model: Optional[int] = None,
+    auto_batch_size: bool = False,
+    auto_batch_size_max: int = 128,
     device: Optional[torch.device] = None
 ):
     """
@@ -218,11 +341,19 @@ def run_inference(
         batch_size: Batch size for inference
         num_workers: DataLoader worker processes
         models_to_use: List of model names to use (default: all available)
+        max_folds_per_model: Max fold checkpoints to use per backbone (default: all available)
+        auto_batch_size: Auto-tune batch size for GPU inference
+        auto_batch_size_max: Upper bound used for auto batch size search
         device: PyTorch device (default: auto-detect)
     """
     if device is None:
         device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         logger.info(f"Using device: {device}")
+
+    if max_folds_per_model is not None and max_folds_per_model <= 0:
+        raise ValueError("max_folds_per_model must be > 0 when provided")
+    if auto_batch_size_max <= 0:
+        raise ValueError("auto_batch_size_max must be > 0")
 
     data_dir = Path(data_dir)
     model_dir = Path(model_dir)
@@ -261,6 +392,50 @@ def run_inference(
     if models_to_use is None:
         models_to_use = list(model_configs.keys())
 
+    if device.type == 'cuda':
+        gpu_count = torch.cuda.device_count()
+        gpu_names = [torch.cuda.get_device_name(i) for i in range(gpu_count)]
+        logger.info("Visible CUDA GPUs (%d): %s", gpu_count, ", ".join(gpu_names))
+
+    model_weight_files: Dict[str, List[Path]] = {}
+    for model_name in models_to_use:
+        config = model_configs[model_name]
+        model_subdir = config['subdir']
+        model_weights_dir = model_dir / '2DNet' / model_subdir
+
+        # Look for model weights across all available folds.
+        weight_files = sorted(model_weights_dir.glob('model_epoch_best_*.pth'))
+        if not weight_files:
+            weight_files = sorted(model_weights_dir.glob('*.pth'))
+
+        if not weight_files:
+            logger.warning(f"No weights found for {model_name} in {model_weights_dir}")
+            continue
+
+        if max_folds_per_model is not None and len(weight_files) > max_folds_per_model:
+            logger.info(
+                "Limiting %s folds from %d to %d (via --max_folds_per_model)",
+                model_name,
+                len(weight_files),
+                max_folds_per_model
+            )
+            weight_files = weight_files[:max_folds_per_model]
+
+        model_weight_files[model_name] = weight_files
+
+    if auto_batch_size:
+        if device.type != 'cuda':
+            logger.warning("Ignoring --auto_batch_size on non-CUDA device; using provided batch_size=%d", batch_size)
+        else:
+            batch_size = _auto_select_batch_size(
+                model_configs=model_configs,
+                model_weight_files=model_weight_files,
+                models_to_use=models_to_use,
+                device=device,
+                max_batch_size=auto_batch_size_max
+            )
+    logger.info("Using inference batch size: %d", batch_size)
+
     # Collect predictions from all models
     all_predictions = {}
 
@@ -285,32 +460,59 @@ def run_inference(
         img_size = config['image_size']
         dataloader = dataloaders[img_size]
         model_weights_dir = model_dir / '2DNet' / model_subdir
-
-        # Look for model weights (any fold)
-        weight_files = list(model_weights_dir.glob('model_epoch_best_*.pth'))
-        if not weight_files:
-            weight_files = list(model_weights_dir.glob('*.pth'))
-
+        weight_files = model_weight_files.get(model_name, [])
         if not weight_files:
             logger.warning(f"No weights found for {model_name} in {model_weights_dir}")
             continue
 
-        # Use first available weight file
-        weight_path = weight_files[0]
-        logger.info(f"Loading {model_name} from {weight_path}")
+        logger.info(
+            "Loading %d fold checkpoint(s) for %s from %s",
+            len(weight_files),
+            model_name,
+            model_weights_dir
+        )
 
-        try:
-            model = load_2d_model(model_name, str(weight_path), device)
-            features, predictions = extract_features_2d(model, model_name, dataloader, device)
-            all_predictions[model_name] = predictions
+        fold_predictions = []
+        for fold_idx, weight_path in enumerate(weight_files):
+            logger.info(
+                "  -> Fold checkpoint %d/%d: %s",
+                fold_idx + 1,
+                len(weight_files),
+                weight_path.name
+            )
+            try:
+                model = load_2d_model(model_name, str(weight_path), device)
+                _, predictions = extract_features_2d(model, model_name, dataloader, device)
+                fold_predictions.append(predictions)
+            except Exception as e:
+                logger.error(f"Error loading {model_name} fold from {weight_path}: {e}")
+            finally:
+                # Free GPU memory
+                try:
+                    del model
+                except UnboundLocalError:
+                    pass
+                if device.type == 'cuda':
+                    torch.cuda.empty_cache()
 
-            # Free GPU memory
-            del model
-            torch.cuda.empty_cache()
-
-        except Exception as e:
-            logger.error(f"Error loading {model_name}: {e}")
+        if not fold_predictions:
+            logger.warning("No valid fold checkpoints were loaded for %s", model_name)
             continue
+
+        # Stage 1 ensemble: average predictions across folds for each backbone.
+        model_predictions = {}
+        model_filenames = sorted({fname for preds in fold_predictions for fname in preds.keys()})
+        for fname in model_filenames:
+            preds = [preds_by_fold[fname] for preds_by_fold in fold_predictions if fname in preds_by_fold]
+            model_predictions[fname] = np.mean(preds, axis=0)
+
+        all_predictions[model_name] = model_predictions
+        logger.info(
+            "Averaged %d fold(s) for %s over %d slice(s)",
+            len(fold_predictions),
+            model_name,
+            len(model_predictions)
+        )
 
     if not all_predictions:
         raise ValueError("No models were successfully loaded")
@@ -410,6 +612,23 @@ def main():
         help='Models to use for ensemble (default: all available)'
     )
     parser.add_argument(
+        '--max_folds_per_model',
+        type=int,
+        default=None,
+        help='Maximum fold checkpoints to use per backbone (default: all available)'
+    )
+    parser.add_argument(
+        '--auto_batch_size',
+        action='store_true',
+        help='Automatically select the largest safe batch size on visible GPUs'
+    )
+    parser.add_argument(
+        '--auto_batch_size_max',
+        type=int,
+        default=128,
+        help='Upper bound for auto batch size search'
+    )
+    parser.add_argument(
         '--cpu',
         action='store_true',
         help='Force CPU inference'
@@ -443,6 +662,9 @@ def main():
         batch_size=args.batch_size,
         num_workers=args.num_workers,
         models_to_use=args.models,
+        max_folds_per_model=args.max_folds_per_model,
+        auto_batch_size=args.auto_batch_size,
+        auto_batch_size_max=args.auto_batch_size_max,
         device=device
     )
 

@@ -31,6 +31,7 @@ sys.path.insert(0, str(PROJECT_ROOT))
 from inference.run_inference import HEMORRHAGE_TYPES, load_2d_model
 
 logger = logging.getLogger(__name__)
+MODEL_CHOICES = ["DenseNet121_change_avg", "DenseNet169_change_avg", "se_resnext101_32x4d"]
 
 
 def parse_args() -> argparse.Namespace:
@@ -43,14 +44,29 @@ def parse_args() -> argparse.Namespace:
         "--output_dir", type=str, required=True, help="Directory to save saliency panel images"
     )
     parser.add_argument(
+        "--saliency_mode",
+        type=str,
+        choices=["single", "ensemble"],
+        default="ensemble",
+        help="How to compute saliency overlays",
+    )
+    parser.add_argument(
         "--model_dir", type=str, default="./models", help="Directory containing model weights"
     )
     parser.add_argument(
         "--model",
         type=str,
         default="DenseNet121_change_avg",
-        choices=["DenseNet121_change_avg", "DenseNet169_change_avg", "se_resnext101_32x4d"],
+        choices=MODEL_CHOICES,
         help="Backbone to use for saliency",
+    )
+    parser.add_argument(
+        "--ensemble_models",
+        type=str,
+        nargs="+",
+        choices=MODEL_CHOICES,
+        default=MODEL_CHOICES,
+        help="Backbones to include for ensemble saliency mode",
     )
     parser.add_argument(
         "--weight_path",
@@ -145,6 +161,14 @@ def _normalize_map(x: np.ndarray) -> np.ndarray:
     if max_v > 0:
         x /= max_v
     return x
+
+
+def _normalize_prob_vector(probs: np.ndarray) -> np.ndarray:
+    probs = probs.astype(np.float32)
+    s = float(np.sum(probs))
+    if s > 0:
+        return probs / s
+    return probs
 
 
 def _preprocess_slice_for_model(png_path: Path, image_size: int) -> Tuple[np.ndarray, torch.Tensor]:
@@ -253,7 +277,7 @@ def _render_panel(
     bar_probs: np.ndarray,
     bar_pred_idx: int,
     bar_source_label: str,
-    saliency_model_label: str,
+    saliency_source_label: str,
     saliency_score: float,
 ) -> None:
     fig, axes = plt.subplots(1, 3, figsize=(15, 5), constrained_layout=True)
@@ -263,7 +287,7 @@ def _render_panel(
     axes[0].axis("off")
 
     axes[1].imshow(overlay_rgb)
-    axes[1].set_title(f"Saliency overlay (single model)\nscore={saliency_score:.5f}")
+    axes[1].set_title(f"Saliency overlay\nscore={saliency_score:.5f}")
     axes[1].axis("off")
 
     bars = axes[2].bar(np.arange(len(HEMORRHAGE_TYPES)), bar_probs, color="#6aa4ff")
@@ -279,7 +303,7 @@ def _render_panel(
     fig.text(
         0.5,
         0.015,
-        f"Saliency source: single model {saliency_model_label}. "
+        f"Saliency source: {saliency_source_label}. "
         f"Bar chart source: {bar_source_label}.",
         ha="center",
         va="bottom",
@@ -307,16 +331,52 @@ def main() -> None:
         raise ValueError("--target_class must be in [0, 5]")
 
     device = torch.device("cpu" if args.cpu else ("cuda" if torch.cuda.is_available() else "cpu"))
-    weight_path = _find_weight_file(model_dir=model_dir, model_name=args.model, explicit_path=args.weight_path)
-    _, image_size = _model_config(args.model)
-    if args.image_size_override is not None:
-        image_size = int(args.image_size_override)
-
     logger.info("Using device: %s", device)
-    logger.info("Loading model %s from %s", args.model, weight_path)
-    logger.info("Saliency input size: %d", image_size)
-    model = load_2d_model(args.model, str(weight_path), device)
-    saliency_model_label = f"{args.model} ({weight_path.name})"
+
+    if args.saliency_mode == "single":
+        weight_path = _find_weight_file(
+            model_dir=model_dir, model_name=args.model, explicit_path=args.weight_path
+        )
+        _, image_size = _model_config(args.model)
+        if args.image_size_override is not None:
+            image_size = int(args.image_size_override)
+        logger.info("Loading single-model saliency %s from %s", args.model, weight_path)
+        logger.info("Saliency input size: %d", image_size)
+        saliency_models: Dict[str, Dict[str, object]] = {
+            args.model: {
+                "model": load_2d_model(args.model, str(weight_path), device),
+                "image_size": image_size,
+                "weight_path": weight_path,
+            }
+        }
+        saliency_source_label = f"single model {args.model} ({weight_path.name})"
+    else:
+        if args.weight_path is not None:
+            logger.warning("--weight_path is ignored in ensemble saliency mode.")
+        if args.model != "DenseNet121_change_avg":
+            logger.warning("--model is ignored in ensemble saliency mode.")
+        saliency_models = {}
+        for model_name in args.ensemble_models:
+            weight_path = _find_weight_file(
+                model_dir=model_dir, model_name=model_name, explicit_path=None
+            )
+            _, image_size = _model_config(model_name)
+            if args.image_size_override is not None:
+                image_size = int(args.image_size_override)
+            logger.info(
+                "Loading ensemble saliency component %s from %s (input size %d)",
+                model_name,
+                weight_path,
+                image_size,
+            )
+            saliency_models[model_name] = {
+                "model": load_2d_model(model_name, str(weight_path), device),
+                "image_size": image_size,
+                "weight_path": weight_path,
+            }
+        saliency_source_label = (
+            "equal-weight normalized per-model outputs + normalized saliency maps"
+        )
 
     ensemble_slice_probs = _load_ensemble_slice_probs(args.ensemble_slice_csv)
     if ensemble_slice_probs:
@@ -360,35 +420,99 @@ def main() -> None:
                 continue
 
             try:
-                brain_gray, inp = _preprocess_slice_for_model(png_path=png_path, image_size=image_size)
-                inp = inp.to(device)
-                inp.requires_grad_(True)
-                model.zero_grad(set_to_none=True)
+                if args.saliency_mode == "single":
+                    model_name = args.model
+                    model_bundle = saliency_models[model_name]
+                    model = model_bundle["model"]
+                    image_size = int(model_bundle["image_size"])
 
-                logits = _forward_logits(model, args.model, inp)
-                model_probs = torch.sigmoid(logits)[0].detach().cpu().numpy().astype(np.float32)
-                model_pred_idx = int(np.argmax(model_probs))
-                target_idx = (
-                    int(args.target_class) if args.target_class is not None else model_pred_idx
+                    brain_gray, inp = _preprocess_slice_for_model(
+                        png_path=png_path, image_size=image_size
+                    )
+                    inp = inp.to(device)
+                    inp.requires_grad_(True)
+                    model.zero_grad(set_to_none=True)
+
+                    logits = _forward_logits(model, model_name, inp)
+                    model_probs = torch.sigmoid(logits)[0].detach().cpu().numpy().astype(np.float32)
+                    model_pred_idx = int(np.argmax(model_probs))
+                    target_idx = (
+                        int(args.target_class) if args.target_class is not None else model_pred_idx
+                    )
+
+                    logits[0, target_idx].backward()
+                    saliency = inp.grad.detach().abs().mean(dim=1)[0].cpu().numpy()
+                    saliency = cv2.resize(saliency, (brain_gray.shape[1], brain_gray.shape[0]))
+                    saliency = _normalize_map(saliency)
+                    saliency_score = float(np.mean(np.abs(saliency)))
+                    overlay_rgb = _overlay(brain_gray, saliency)
+
+                    combined_probs = model_probs
+                    component_probs = {model_name: model_probs}
+                    component_probs_normalized = {model_name: _normalize_prob_vector(model_probs)}
+                else:
+                    component_probs: Dict[str, np.ndarray] = {}
+                    component_probs_normalized: Dict[str, np.ndarray] = {}
+                    brain_gray = None
+
+                    # Pass 1: get per-model probabilities (equal weighted + normalized).
+                    for model_name, model_bundle in saliency_models.items():
+                        model = model_bundle["model"]
+                        image_size = int(model_bundle["image_size"])
+                        brain_gray_this, inp = _preprocess_slice_for_model(
+                            png_path=png_path, image_size=image_size
+                        )
+                        if brain_gray is None:
+                            brain_gray = brain_gray_this
+                        inp = inp.to(device)
+                        with torch.no_grad():
+                            logits = _forward_logits(model, model_name, inp)
+                            probs = torch.sigmoid(logits)[0].detach().cpu().numpy().astype(np.float32)
+                        component_probs[model_name] = probs
+                        component_probs_normalized[model_name] = _normalize_prob_vector(probs)
+
+                    norm_prob_stack = np.stack(
+                        [component_probs_normalized[m] for m in sorted(component_probs_normalized.keys())],
+                        axis=0,
+                    )
+                    combined_probs = np.mean(norm_prob_stack, axis=0)
+                    model_pred_idx = int(np.argmax(combined_probs))
+                    target_idx = int(args.target_class) if args.target_class is not None else model_pred_idx
+
+                    # Pass 2: get per-model saliency, normalize each map, then average equally.
+                    saliency_maps: List[np.ndarray] = []
+                    for model_name, model_bundle in saliency_models.items():
+                        model = model_bundle["model"]
+                        image_size = int(model_bundle["image_size"])
+                        _, inp = _preprocess_slice_for_model(png_path=png_path, image_size=image_size)
+                        inp = inp.to(device)
+                        inp.requires_grad_(True)
+                        model.zero_grad(set_to_none=True)
+                        logits = _forward_logits(model, model_name, inp)
+                        logits[0, target_idx].backward()
+                        saliency = inp.grad.detach().abs().mean(dim=1)[0].cpu().numpy()
+                        saliency = cv2.resize(saliency, (brain_gray.shape[1], brain_gray.shape[0]))
+                        saliency_maps.append(_normalize_map(saliency))
+
+                    saliency = np.mean(np.stack(saliency_maps, axis=0), axis=0)
+                    saliency_score = float(np.mean(np.abs(saliency)))
+                    overlay_rgb = _overlay(brain_gray, saliency)
+
+                bar_probs = combined_probs
+                bar_source = (
+                    "equal-weight normalized model ensemble probabilities"
+                    if args.saliency_mode == "ensemble"
+                    else "single model probabilities"
                 )
-
-                bar_probs = model_probs
-                bar_source = "single model probabilities"
                 if filename in ensemble_slice_probs:
                     bar_probs = ensemble_slice_probs[filename]
                     bar_source = "ensemble probabilities"
                 elif args.ensemble_slice_csv is not None:
                     logger.warning(
-                        "Slice %s missing in ensemble CSV; using single-model probabilities for bar chart.",
+                        "Slice %s missing in ensemble CSV; using computed saliency probabilities for bar chart.",
                         filename,
                     )
                 bar_pred_idx = int(np.argmax(bar_probs))
-
-                logits[0, target_idx].backward()
-                saliency = inp.grad.detach().abs().mean(dim=1)[0].cpu().numpy()
-                saliency = cv2.resize(saliency, (brain_gray.shape[1], brain_gray.shape[0]))
-                saliency_score = float(np.mean(np.abs(saliency)))
-                overlay_rgb = _overlay(brain_gray, saliency)
 
                 stem = Path(filename).stem
                 out_name = (
@@ -407,7 +531,7 @@ def main() -> None:
                     bar_probs=bar_probs,
                     bar_pred_idx=bar_pred_idx,
                     bar_source_label=bar_source,
-                    saliency_model_label=saliency_model_label,
+                    saliency_source_label=saliency_source_label,
                     saliency_score=saliency_score,
                 )
 
@@ -419,8 +543,18 @@ def main() -> None:
                     "predicted_class_index": bar_pred_idx,
                     "predicted_class_name": HEMORRHAGE_TYPES[bar_pred_idx],
                     "bar_prob_source": bar_source,
-                    "saliency_model_name": args.model,
-                    "saliency_model_weight": weight_path.name,
+                    "saliency_mode": args.saliency_mode,
+                    "saliency_model_name": (
+                        args.model if args.saliency_mode == "single" else "ensemble"
+                    ),
+                    "saliency_model_weight": (
+                        str(saliency_models[args.model]["weight_path"].name)
+                        if args.saliency_mode == "single"
+                        else ",".join(
+                            f"{m}:{saliency_models[m]['weight_path'].name}"
+                            for m in sorted(saliency_models.keys())
+                        )
+                    ),
                     "saliency_model_predicted_class_index": model_pred_idx,
                     "saliency_model_predicted_class_name": HEMORRHAGE_TYPES[model_pred_idx],
                     "target_class_index": target_idx,
@@ -428,7 +562,15 @@ def main() -> None:
                 }
                 for i, cls_name in enumerate(HEMORRHAGE_TYPES):
                     row_payload[f"prob_{cls_name}"] = float(bar_probs[i])
-                    row_payload[f"saliency_model_prob_{cls_name}"] = float(model_probs[i])
+                    row_payload[f"saliency_model_prob_{cls_name}"] = float(combined_probs[i])
+                    if args.saliency_mode == "ensemble":
+                        for model_name in sorted(component_probs.keys()):
+                            row_payload[f"{model_name}_prob_{cls_name}"] = float(
+                                component_probs[model_name][i]
+                            )
+                            row_payload[f"{model_name}_prob_norm_{cls_name}"] = float(
+                                component_probs_normalized[model_name][i]
+                            )
                 slice_rows.append(row_payload)
                 all_slice_rows.append(row_payload)
 
