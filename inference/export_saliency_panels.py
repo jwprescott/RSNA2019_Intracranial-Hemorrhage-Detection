@@ -4,7 +4,7 @@ Export per-slice saliency 3-panel images for RSNA 2D models.
 
 Panel layout:
 1) Brain-window slice (grayscale)
-2) Gradient saliency overlay
+2) Saliency overlay
 3) Class probability bars
 """
 
@@ -49,6 +49,13 @@ def parse_args() -> argparse.Namespace:
         choices=["single", "ensemble"],
         default="ensemble",
         help="How to compute saliency overlays",
+    )
+    parser.add_argument(
+        "--saliency_method",
+        type=str,
+        choices=["input_grad", "gradcam", "gradcampp"],
+        default="input_grad",
+        help="Saliency algorithm to use",
     )
     parser.add_argument(
         "--model_dir", type=str, default="./models", help="Directory containing model weights"
@@ -152,6 +159,109 @@ def _forward_logits(model: torch.nn.Module, model_name: str, x: torch.Tensor) ->
         feat = feat.view(feat.size(0), -1)
         return net.model_ft.last_linear(feat)
     return model(x)
+
+
+def _gradcam_target_layer(model: torch.nn.Module, model_name: str) -> torch.nn.Module:
+    net = model.module if hasattr(model, "module") else model
+    if "DenseNet121" in model_name:
+        return net.densenet121
+    if "DenseNet169" in model_name:
+        return net.densenet169
+    if "se_resnext" in model_name:
+        return net.model_ft.layer4
+    raise ValueError(f"Unsupported model for Grad-CAM saliency: {model_name}")
+
+
+def _maybe_unwrap_data_parallel_for_saliency(
+    model: torch.nn.Module, device: torch.device
+) -> torch.nn.Module:
+    if isinstance(model, torch.nn.DataParallel):
+        logger.info(
+            "Using single-device saliency for hook stability (unwrapping DataParallel)."
+        )
+        model = model.module
+        model = model.to(device)
+        model.eval()
+    return model
+
+
+def _compute_saliency_map(
+    model: torch.nn.Module,
+    model_name: str,
+    inp: torch.Tensor,
+    target_idx: int,
+    saliency_method: str,
+) -> np.ndarray:
+    if saliency_method == "input_grad":
+        inp = inp.clone().detach().requires_grad_(True)
+        model.zero_grad(set_to_none=True)
+        logits = _forward_logits(model, model_name, inp)
+        logits[0, target_idx].backward()
+        return inp.grad.detach().abs().mean(dim=1)[0].cpu().numpy()
+
+    activations: Dict[str, torch.Tensor] = {}
+    gradients: Dict[str, torch.Tensor] = {}
+    target_layer = _gradcam_target_layer(model, model_name)
+
+    def _forward_hook(_module: torch.nn.Module, _inputs, output: torch.Tensor):
+        activations["value"] = output
+
+    def _backward_hook(_module: torch.nn.Module, _grad_inputs, grad_outputs):
+        gradients["value"] = grad_outputs[0]
+
+    forward_handle = target_layer.register_forward_hook(_forward_hook)
+    if hasattr(target_layer, "register_full_backward_hook"):
+        backward_handle = target_layer.register_full_backward_hook(_backward_hook)
+    else:
+        backward_handle = target_layer.register_backward_hook(_backward_hook)
+    try:
+        model.zero_grad(set_to_none=True)
+        logits = _forward_logits(model, model_name, inp.clone().detach())
+        logits[0, target_idx].backward()
+
+        if "value" not in activations or "value" not in gradients:
+            raise RuntimeError(
+                f"Failed to capture Grad-CAM tensors for {model_name} ({saliency_method})."
+            )
+
+        act = activations["value"]
+        grad = gradients["value"]
+
+        if saliency_method == "gradcam":
+            weights = grad.mean(dim=(2, 3), keepdim=True)
+        elif saliency_method == "gradcampp":
+            grad_sq = grad.pow(2)
+            grad_cube = grad.pow(3)
+            sum_act = act.sum(dim=(2, 3), keepdim=True)
+            eps = 1e-8
+            denom = 2.0 * grad_sq + sum_act * grad_cube
+            denom = torch.where(denom != 0.0, denom, torch.full_like(denom, eps))
+            alpha = grad_sq / denom
+            weights = (alpha * torch.relu(grad)).sum(dim=(2, 3), keepdim=True)
+        else:
+            raise ValueError(f"Unknown saliency method: {saliency_method}")
+
+        cam = torch.relu((weights * act).sum(dim=1))[0]
+        return cam.detach().cpu().numpy()
+    finally:
+        forward_handle.remove()
+        backward_handle.remove()
+
+
+def _predict_probs(model: torch.nn.Module, model_name: str, inp: torch.Tensor) -> np.ndarray:
+    with torch.no_grad():
+        logits = _forward_logits(model, model_name, inp)
+        probs = torch.sigmoid(logits)[0].detach().cpu().numpy().astype(np.float32)
+    return probs
+
+
+def _saliency_method_label(saliency_method: str) -> str:
+    labels = {
+        "input_grad": "input-gradient",
+        "gradcam": "Grad-CAM",
+        "gradcampp": "Grad-CAM++",
+    }
+    return labels[saliency_method]
 
 
 def _normalize_map(x: np.ndarray) -> np.ndarray:
@@ -332,6 +442,7 @@ def main() -> None:
 
     device = torch.device("cpu" if args.cpu else ("cuda" if torch.cuda.is_available() else "cpu"))
     logger.info("Using device: %s", device)
+    logger.info("Saliency method: %s", _saliency_method_label(args.saliency_method))
 
     if args.saliency_mode == "single":
         weight_path = _find_weight_file(
@@ -342,14 +453,19 @@ def main() -> None:
             image_size = int(args.image_size_override)
         logger.info("Loading single-model saliency %s from %s", args.model, weight_path)
         logger.info("Saliency input size: %d", image_size)
+        loaded_model = load_2d_model(args.model, str(weight_path), device)
+        loaded_model = _maybe_unwrap_data_parallel_for_saliency(loaded_model, device)
         saliency_models: Dict[str, Dict[str, object]] = {
             args.model: {
-                "model": load_2d_model(args.model, str(weight_path), device),
+                "model": loaded_model,
                 "image_size": image_size,
                 "weight_path": weight_path,
             }
         }
-        saliency_source_label = f"single model {args.model} ({weight_path.name})"
+        saliency_source_label = (
+            f"single model {args.model} ({weight_path.name}), "
+            f"method={_saliency_method_label(args.saliency_method)}"
+        )
     else:
         if args.weight_path is not None:
             logger.warning("--weight_path is ignored in ensemble saliency mode.")
@@ -369,13 +485,16 @@ def main() -> None:
                 weight_path,
                 image_size,
             )
+            loaded_model = load_2d_model(model_name, str(weight_path), device)
+            loaded_model = _maybe_unwrap_data_parallel_for_saliency(loaded_model, device)
             saliency_models[model_name] = {
-                "model": load_2d_model(model_name, str(weight_path), device),
+                "model": loaded_model,
                 "image_size": image_size,
                 "weight_path": weight_path,
             }
         saliency_source_label = (
-            "equal-weight normalized per-model outputs + normalized saliency maps"
+            "equal-weight normalized per-model outputs + normalized saliency maps "
+            f"(method={_saliency_method_label(args.saliency_method)})"
         )
 
     ensemble_slice_probs = _load_ensemble_slice_probs(args.ensemble_slice_csv)
@@ -430,18 +549,19 @@ def main() -> None:
                         png_path=png_path, image_size=image_size
                     )
                     inp = inp.to(device)
-                    inp.requires_grad_(True)
-                    model.zero_grad(set_to_none=True)
-
-                    logits = _forward_logits(model, model_name, inp)
-                    model_probs = torch.sigmoid(logits)[0].detach().cpu().numpy().astype(np.float32)
+                    model_probs = _predict_probs(model, model_name, inp)
                     model_pred_idx = int(np.argmax(model_probs))
                     target_idx = (
                         int(args.target_class) if args.target_class is not None else model_pred_idx
                     )
 
-                    logits[0, target_idx].backward()
-                    saliency = inp.grad.detach().abs().mean(dim=1)[0].cpu().numpy()
+                    saliency = _compute_saliency_map(
+                        model=model,
+                        model_name=model_name,
+                        inp=inp,
+                        target_idx=target_idx,
+                        saliency_method=args.saliency_method,
+                    )
                     saliency = cv2.resize(saliency, (brain_gray.shape[1], brain_gray.shape[0]))
                     saliency = _normalize_map(saliency)
                     saliency_score = float(np.mean(np.abs(saliency)))
@@ -465,9 +585,7 @@ def main() -> None:
                         if brain_gray is None:
                             brain_gray = brain_gray_this
                         inp = inp.to(device)
-                        with torch.no_grad():
-                            logits = _forward_logits(model, model_name, inp)
-                            probs = torch.sigmoid(logits)[0].detach().cpu().numpy().astype(np.float32)
+                        probs = _predict_probs(model, model_name, inp)
                         component_probs[model_name] = probs
                         component_probs_normalized[model_name] = _normalize_prob_vector(probs)
 
@@ -486,11 +604,13 @@ def main() -> None:
                         image_size = int(model_bundle["image_size"])
                         _, inp = _preprocess_slice_for_model(png_path=png_path, image_size=image_size)
                         inp = inp.to(device)
-                        inp.requires_grad_(True)
-                        model.zero_grad(set_to_none=True)
-                        logits = _forward_logits(model, model_name, inp)
-                        logits[0, target_idx].backward()
-                        saliency = inp.grad.detach().abs().mean(dim=1)[0].cpu().numpy()
+                        saliency = _compute_saliency_map(
+                            model=model,
+                            model_name=model_name,
+                            inp=inp,
+                            target_idx=target_idx,
+                            saliency_method=args.saliency_method,
+                        )
                         saliency = cv2.resize(saliency, (brain_gray.shape[1], brain_gray.shape[0]))
                         saliency_maps.append(_normalize_map(saliency))
 
@@ -544,6 +664,7 @@ def main() -> None:
                     "predicted_class_name": HEMORRHAGE_TYPES[bar_pred_idx],
                     "bar_prob_source": bar_source,
                     "saliency_mode": args.saliency_mode,
+                    "saliency_method": args.saliency_method,
                     "saliency_model_name": (
                         args.model if args.saliency_mode == "single" else "ensemble"
                     ),

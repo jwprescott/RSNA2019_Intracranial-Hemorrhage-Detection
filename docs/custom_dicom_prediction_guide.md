@@ -20,6 +20,7 @@ Important model behavior:
   normalized per-model class outputs and normalized per-model saliency maps.
 - The bar chart in saliency panels uses ensemble probabilities (from `predictions_per_slice.csv`).
 - Each panel includes text noting: ensemble saliency source + bar source.
+- Saliency method is configurable via `--saliency_method {input_grad,gradcam,gradcampp}`.
 
 ## Key Files
 
@@ -208,6 +209,7 @@ singularity exec --nv \
   --output_dir "$OUTPUT_DIR/saliency_panels" \
   --model_dir /workspace/models \
   --saliency_mode ensemble \
+  --saliency_method input_grad \
   --ensemble_slice_csv "$OUTPUT_DIR/predictions_per_slice.csv" \
   --image_size_override 224
 ```

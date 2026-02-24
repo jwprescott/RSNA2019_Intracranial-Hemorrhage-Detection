@@ -20,6 +20,7 @@ N_JOBS="${N_JOBS:-8}"
 BATCH_SIZE="${BATCH_SIZE:-16}"
 NUM_WORKERS="${NUM_WORKERS:-0}"
 IMAGE_SIZE_OVERRIDE="${IMAGE_SIZE_OVERRIDE:-224}"
+SALIENCY_METHOD="${SALIENCY_METHOD:-input_grad}"
 AUTO_BATCH_SIZE="${AUTO_BATCH_SIZE:-0}"
 AUTO_BATCH_SIZE_MAX="${AUTO_BATCH_SIZE_MAX:-128}"
 
@@ -69,6 +70,10 @@ while [[ $# -gt 0 ]]; do
             IMAGE_SIZE_OVERRIDE="$2"
             shift 2
             ;;
+        --saliency_method)
+            SALIENCY_METHOD="$2"
+            shift 2
+            ;;
         -h|--help)
             cat <<EOF
 Usage: $0 --dicom_dir /path/to/dicoms [options]
@@ -85,6 +90,7 @@ Options:
   --auto_batch_size         Auto-select batch size on available GPUs
   --auto_batch_size_max N   Upper bound for auto batch size search (default: ${AUTO_BATCH_SIZE_MAX})
   --image_size_override N   Saliency input size (default: ${IMAGE_SIZE_OVERRIDE})
+  --saliency_method NAME    Saliency method: input_grad|gradcam|gradcampp (default: ${SALIENCY_METHOD})
 EOF
             exit 0
             ;;
@@ -143,6 +149,7 @@ docker run --rm --gpus all --ipc=host \
     -e AUTO_BATCH_SIZE="${AUTO_BATCH_SIZE}" \
     -e AUTO_BATCH_SIZE_MAX="${AUTO_BATCH_SIZE_MAX}" \
     -e IMAGE_SIZE_OVERRIDE="${IMAGE_SIZE_OVERRIDE}" \
+    -e SALIENCY_METHOD="${SALIENCY_METHOD}" \
     "${IMAGE}" \
     bash -lc '
 set -euo pipefail
@@ -181,6 +188,7 @@ SALIENCY_ARGS=(
     --output_dir /run/output/saliency_panels
     --model_dir /models
     --saliency_mode ensemble
+    --saliency_method "${SALIENCY_METHOD}"
     --ensemble_slice_csv /run/output/predictions_per_slice.csv
 )
 if [[ -n "${IMAGE_SIZE_OVERRIDE}" ]]; then

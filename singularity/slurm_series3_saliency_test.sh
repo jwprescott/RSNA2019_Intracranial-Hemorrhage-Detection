@@ -24,6 +24,7 @@ OUTPUT_DIR="${RUN_ROOT}/output"
 # Isolated dependency path for container python.
 PYDEPS="${PROJECT_DIR}/.cache/singularity_pydeps"
 CACHE_DIR="${CACHE_DIR:-${PROJECT_DIR}/.cache/model_backbones}"
+SALIENCY_METHOD="${SALIENCY_METHOD:-input_grad}"
 
 echo "============================================================"
 echo "RSNA series3 saliency test"
@@ -36,6 +37,7 @@ echo "Run root: ${RUN_ROOT}"
 echo "SIF: ${SIF_IMAGE}"
 echo "PYDEPS: ${PYDEPS}"
 echo "Cache dir: ${CACHE_DIR}"
+echo "Saliency method: ${SALIENCY_METHOD}"
 echo "============================================================"
 
 if [ ! -f "${SIF_IMAGE}" ]; then
@@ -89,6 +91,7 @@ echo "[3/3] Exporting 3-panel saliency images"
     --output_dir "${OUTPUT_DIR}/saliency_panels" \
     --model_dir /workspace/models \
     --saliency_mode ensemble \
+    --saliency_method "${SALIENCY_METHOD}" \
     --ensemble_slice_csv "${OUTPUT_DIR}/predictions_per_slice.csv" \
     --image_size_override 224
 

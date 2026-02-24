@@ -126,6 +126,7 @@ Inference averages all available fold checkpoints per backbone (`model_epoch_bes
 Optional for workstation GPU tuning: add `--auto_batch_size` (and optionally `--auto_batch_size_max 256`) to auto-select the largest safe inference batch size.
 Auto batch size is cached by default in `.cache/auto_batch_size_cache.json` and reused on matching GPU/model configs.
 If a runtime CUDA OOM still occurs, inference automatically retries with smaller batch sizes until it succeeds.
+Saliency export supports `--saliency_method input_grad|gradcam|gradcampp` (default: `input_grad`).
 Optional: set `--cache_dir /path/to/cache` to persist PyTorch/pretrainedmodels caches for other workflows.
 
 ## Quick Start (Singularity)
